@@ -34,17 +34,29 @@ final class AudioCaptureService {
         engine.stop()
         engine = AVAudioEngine()
 
-        installTap()
         addConfigObserver()
 
-        engine.prepare()
-        do {
-            try engine.start()
-        } catch {
-            // Do not leave the observer or tap behind if the engine will not run.
+        // installTap, prepare and start can raise Objective-C exceptions from
+        // AVFoundation on a bad audio state (e.g. an input format that no longer
+        // matches the hardware mid device-change). Swift try cannot catch those,
+        // and unhandled they corrupt the runtime and crash the app on the next
+        // UI event. Catch them here, plus any Swift error from start(), and fail
+        // the start cleanly so the next attempt rebuilds from scratch.
+        var startError: Error?
+        let raised = YapRunCatchingExceptions { [self] in
+            installTap()
+            engine.prepare()
+            do {
+                try engine.start()
+            } catch {
+                startError = error
+            }
+        }
+
+        if let failure = raised ?? startError {
             removeConfigObserver()
             engine.inputNode.removeTap(onBus: 0)
-            throw error
+            throw failure
         }
     }
 
@@ -68,17 +80,20 @@ final class AudioCaptureService {
     private func installTap() {
         let input = engine.inputNode
         input.removeTap(onBus: 0)
-        let format = input.outputFormat(forBus: 0)
 
         // Mid-switch the node can briefly report a degenerate format (0 Hz or
-        // 0 channels), and installTap throws an uncatchable ObjC exception on
-        // one. Skip it and let the next configuration change rebuild the tap
-        // once the device has settled.
+        // 0 channels). Skip then and let the next configuration change rebuild
+        // the tap once the device has settled.
+        let format = input.outputFormat(forBus: 0)
         guard format.sampleRate > 0, format.channelCount > 0 else { return }
 
+        // Pass nil so the tap adopts the input node's own live format. Passing
+        // an explicit format can disagree with the hardware the instant a device
+        // changes, and installTap throws an ObjC exception on the mismatch; the
+        // buffers are converted downstream anyway, so the exact format is moot.
         // 2048 frames is about 23 level updates a second, which the meter needs
         // to look alive.
-        input.installTap(onBus: 0, bufferSize: 2048, format: format) { [weak self] buffer, _ in
+        input.installTap(onBus: 0, bufferSize: 2048, format: nil) { [weak self] buffer, _ in
             guard let self else { return }
             self.onBuffer?(buffer)
             self.onLevel?(AudioLevel.normalized(from: buffer))
